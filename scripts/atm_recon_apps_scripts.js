@@ -1,7 +1,7 @@
 /**
  * ================================================================
  *  ATM RECEIVABLES RECONCILIATION — Google Apps Script
- *  Version 1.0  |  Abeokuta Branch  |  All 5 GL Accounts
+ *  Version 2.0  |  Abeokuta Branch  |  All 5 GL Accounts
  * ================================================================
  *
  *  HOW TO USE (every reconciliation period):
@@ -10,9 +10,6 @@
  *  2. Open this Google Sheet
  *  3. Click:  🏧 ATM Recon  →  ▶ Run Reconciliation
  *  4. Check the SUMMARY sheet — all rows must show ✅ BALANCED
- *
- * ================================================================
- */
 
 
 // ════════════════════════════════════════════════════════════════
@@ -38,7 +35,7 @@ const CFG = {
   },
 
   // Transaction codes treated as valid (others are skipped)
-  VALID_TRN_CODES  : ['ATI', 'EDB', 'ESR', 'ESS'],
+  VALID_TRN_CODES  : ['ATI', 'EDB', 'ESR', 'ESS', 'FDB', 'OFF'],
 
   // Keywords used to find and remove old footer rows on each sheet
   FOOTER_KEYWORDS  : ['PROOF BALANCE', 'SYSTEM BALANCE', 'DIFFERENCE']
@@ -183,7 +180,7 @@ function processOneGLFile(file, ss, log) {
     if (!targetSheet) throw new Error(`Sheet "${sheetName}" not found in this workbook`);
 
     // ── Read data from the GL file ──────────────────────────────
-    const sysBal      = findSystemClosingBalance(rawData);
+    const sysBal       = findSystemClosingBalance(rawData);
     const transactions = extractTransactions(rawData, log);
 
     log.push(`   Transactions: ${transactions.length} rows`);
@@ -191,7 +188,7 @@ function processOneGLFile(file, ss, log) {
 
     // ── Update the target sheet ─────────────────────────────────
     removeFooterRows(targetSheet);
-    const lastDataRow = appendTransactions(targetSheet, transactions);
+    const lastDataRow = appendTransactions(targetSheet, transactions, log);
     addFooterRows(targetSheet, lastDataRow, sysBal);
 
     // ── Verify the balance ──────────────────────────────────────
@@ -408,31 +405,72 @@ function removeFooterRows(sheet) {
 //  APPEND NEW TRANSACTIONS (batch write — fast even for 1500+ rows)
 // ════════════════════════════════════════════════════════════════
 
-function appendTransactions(sheet, transactions) {
+/**
+ * DUPLICATE DETECTION — v2.0 FIX
+ * ─────────────────────────────────────────────────────────────
+ * The unique key is now RRN + TRN_CODE (e.g. "7922504867|ATI").
+ *
+ * Why: An EDB settlement always carries the SAME RRN as the
+ * original ATI withdrawal it settles. Under the old RRN-only
+ * guard, when an EDB arrived for an ATI that was already on the
+ * sheet, the EDB was treated as a duplicate and silently dropped.
+ * The credit that should have cleared the receivable never posted,
+ * causing the proof balance to drift further from the GL system
+ * balance after every run.
+ *
+ * With the composite key, "7922504867|ATI" and "7922504867|EDB"
+ * are two distinct entries and are both allowed through. A GENUINE
+ * duplicate — same RRN and same TRN code appearing a second time —
+ * is still blocked correctly.
+ */
+function appendTransactions(sheet, transactions, log) {
   if (transactions.length === 0) return sheet.getLastRow();
 
-  // ── Duplicate guard: collect all RRNs already on this sheet ──
+  // ── Build composite duplicate-key set from existing sheet data ──
   const lastExisting = sheet.getLastRow();
-  const existingRRNs = new Set();
+  const existingKeys = new Set();
+
   if (lastExisting >= 2) {
-    sheet.getRange(2, 1, lastExisting - 1, 1)
-      .getValues()
-      .forEach(r => { if (r[0]) existingRRNs.add(String(r[0])); });
+    // Read columns A (RRN) and D (TRN Code) together in one API call
+    const existingData = sheet
+      .getRange(2, 1, lastExisting - 1, 4)  // cols A–D
+      .getValues();
+
+    existingData.forEach(row => {
+      const rrn     = row[0];                                   // col A
+      const trnCode = String(row[3] || '').trim().toUpperCase(); // col D
+      if (rrn) {
+        existingKeys.add(String(rrn) + '|' + trnCode);
+      }
+    });
   }
 
-  // Keep only transactions whose RRN is not already on the sheet
-  const newOnly = transactions.filter(t => t.rrn && !existingRRNs.has(String(t.rrn)));
+  // ── Filter: keep only rows whose composite key is not yet on sheet ──
+  const newOnly = transactions.filter(t => {
+    if (!t.rrn) return true; // no RRN at all — always allow through
+    return !existingKeys.has(String(t.rrn) + '|' + t.trnCode);
+  });
 
   const skipped = transactions.length - newOnly.length;
-  if (skipped > 0) Logger.log(`   ⚠ Skipped ${skipped} duplicate RRN(s) already on sheet`);
+  if (skipped > 0) {
+    Logger.log(`   ⚠ Skipped ${skipped} true duplicate(s) (same RRN + TRN code already on sheet)`);
+    if (log) log.push(`   ⚠ Skipped ${skipped} true duplicate(s) already on sheet`);
+  }
 
   if (newOnly.length === 0) return sheet.getLastRow();
-  transactions = newOnly;
+
+  // ── Log breakdown by TRN type for auditability ─────────────────
+  const summary = {};
+  newOnly.forEach(t => { summary[t.trnCode] = (summary[t.trnCode] || 0) + 1; });
+  const breakdown = Object.entries(summary)
+    .map(([code, count]) => `${code}=${count}`)
+    .join(', ');
+  if (log) log.push(`   New rows by type: ${breakdown}`);
 
   const startRow = sheet.getLastRow() + 1;
 
   // Build the data array (11 columns per row, balance col = 0 placeholder)
-  const values = transactions.map(t => [
+  const values = newOnly.map(t => [
     t.rrn,          // A — RRN
     t.date1,        // B — Create Date
     t.date2,        // C — Effective Date
@@ -450,10 +488,10 @@ function appendTransactions(sheet, transactions) {
   sheet.getRange(startRow, 1, values.length, 11).setValues(values);
 
   // Write balance formulas in one batch call
-  const formulas = transactions.map((_, i) => [`=H${startRow + i}-G${startRow + i}`]);
+  const formulas = newOnly.map((_, i) => [`=H${startRow + i}-G${startRow + i}`]);
   sheet.getRange(startRow, 9, formulas.length, 1).setFormulas(formulas);
 
-  return startRow + transactions.length - 1; // returns the last data row number
+  return startRow + newOnly.length - 1; // returns the last data row number
 }
 
 
@@ -488,7 +526,7 @@ function addFooterRows(sheet, lastDataRow, sysBal) {
   footerCells.forEach(([r, c]) => sheet.getRange(r, c).setFontWeight('bold'));
 
   // Green (balanced) / Red (difference) conditional formatting
-  const diffCell     = sheet.getRange(diffRow, 9);
+  const diffCell      = sheet.getRange(diffRow, 9);
   const existingRules = sheet.getConditionalFormatRules();
 
   existingRules.push(
